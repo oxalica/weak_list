@@ -2,5 +2,9 @@
 name = "weak_list"
 version = "0.1.0"
 authors = ["uHOOCCOOHu <hooccooh1896@gmail.com>"]
+description = "Strict weak lists"
+repository = "https://github.com/uHOOCCOOHu/weak_list"
+license = "MIT"
+keywords = ["containers", "Rc", "Arc", "weak"]
 
 [dependencies]
