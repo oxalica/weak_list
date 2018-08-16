@@ -59,13 +59,15 @@ impl<T> Link<T> {
         // If in list.
         if let Some(prev_w) = self.prev.take() {
             let prev = prev_w.upgrade().unwrap();
-            let next_link = self.next.take();
-            prev.borrow_mut().next = next_link.clone();
-            if let Some(next_w) = next_link {
-                let next_node = next_w.upgrade().unwrap();
-                next_node.link.borrow_mut().prev = Some(prev_w);
+            let mut prev_link = prev.borrow_mut();
+            match self.next.take() {
+                None => prev_link.next = None,
+                Some(next_w) => {
+                    let next_node = next_w.upgrade().unwrap();
+                    prev_link.next = Some(Rc::downgrade(&next_node));
+                    next_node.link.borrow_mut().prev = Some(prev_w);
+                }
             }
-
         }
     }
 }
@@ -91,7 +93,7 @@ impl<T> WeakList<T> {
         let node = Rc::new(Node {
             value,
             link: Rc::new(RefCell::new(Link {
-                next: self.head.borrow_mut().next.take(),
+                next: self.head.borrow_mut().next.clone(),
                 prev: Some(Rc::downgrade(&self.head)),
             })),
         });
@@ -136,5 +138,86 @@ impl<T> WeakList<T> {
 impl<T> Default for WeakList<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct S {
+        value: i32,
+        buf: Rc<RefCell<Vec<i32>>>,
+    }
+
+    impl Drop for S {
+        fn drop(&mut self) {
+            self.buf.borrow_mut().push(self.value);
+        }
+    }
+
+    #[test]
+    fn basic_test() {
+        use std::mem::replace;
+
+        let buf = Rc::new(RefCell::new(vec![]));
+        let get_last_dropped = || replace(&mut *buf.borrow_mut(), vec![]);
+        let new_s = |value| S { value, buf: Rc::clone(&buf) };
+        let get_values = |v: &[Handle<S>]| -> Vec<i32> {
+            v.iter().map(|h| h.value).collect::<Vec<i32>>()
+        };
+
+        let h5;
+        {
+            let ls = WeakList::new();
+            let get_snapshot = || get_values(&ls.upgrade_all());
+            let mut handles = vec![];
+
+            handles.push(ls.push(new_s(1)));
+            handles.push(ls.push(new_s(2)));
+            handles.push(ls.push(new_s(3)));
+            assert_eq!(get_values(&handles), [1, 2, 3]);
+            assert_eq!(get_snapshot(), [3, 2, 1]);
+            assert_eq!(get_last_dropped(), []);
+
+            handles.pop();
+            assert_eq!(get_values(&handles), [1, 2]);
+            assert_eq!(get_snapshot(), [2, 1]);
+            assert_eq!(get_last_dropped(), [3]);
+
+            ls.push(new_s(4)); // Immediately drop handle. FIXME: Wierd behavior.
+            assert_eq!(get_snapshot(), [2, 1]);
+            assert_eq!(get_last_dropped(), [4]);
+
+            Handle::remove(&handles[0]); // Remove `1` from list.
+            assert_eq!(get_values(&handles), [1, 2]); // Handles will not change.
+            assert_eq!(get_snapshot(), [2]);
+            assert_eq!(get_last_dropped(), []); // No drop now.
+
+            handles.remove(0); // Drop handle to `1`.
+            assert_eq!(get_values(&handles), [2]);
+            assert_eq!(get_snapshot(), [2]);
+            assert_eq!(get_last_dropped(), [1]);
+
+            ls.clear();
+            assert_eq!(get_snapshot(), []);
+            assert_eq!(get_last_dropped(), []); // `clear` never cause drop.
+
+            handles.clear();
+            assert_eq!(get_last_dropped(), [2]);
+
+            handles.push(ls.push(new_s(5)));
+            handles = ls.take_all();
+            assert_eq!(get_values(&handles), [5]);
+            assert_eq!(get_snapshot(), []); // `take_all` remove all elems from list.
+            assert_eq!(get_last_dropped(), []);
+
+            h5 = Handle::clone(&handles[0]);
+        }
+        assert_eq!(h5.value, 5); // Handle can outlive the list
+        assert_eq!(get_last_dropped(), []);
+
+        drop(h5);
+        assert_eq!(get_last_dropped(), [5]);
     }
 }
