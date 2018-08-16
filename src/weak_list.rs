@@ -2,10 +2,17 @@ use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
 
+/// The `Rc`-like handle owning a value,
+/// which may have at most one weak reference in a list.
 pub struct Handle<T> {
     cur: Rc<Node<T>>,
 }
 
+/// The list of weak references of T.
+///
+/// Unlike `Vec<Weak<T>>`, once a weak reference in `WeakList` died,
+/// immediately, it will be removed from the list and both the space of value
+/// and its weak reference will be freed completely.
 pub struct WeakList<T> {
     head: Rc<RefCell<Link<T>>>,
 }
@@ -21,10 +28,18 @@ struct Link<T> {
 }
 
 impl<T> Handle<T> {
-    pub fn remove(this: &Self) {
+    /// Detach the value from the list.
+    /// It removes and frees the weak reference of it in the list immediately
+    /// (if exists).
+    pub fn detach(this: &Self) {
         this.cur.link.borrow_mut().unlink();
     }
 
+    /// Try unwrap the value if `this` is the only `Handle` to it.
+    ///
+    /// If it success, the weak reference of it in the list (if exists) will
+    /// also be removed and freed.
+    /// Otherwise, `this` will be returned back with nothing happened.
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         match Rc::try_unwrap(this.cur) {
             Ok(node) => Ok(node.value),
@@ -86,8 +101,14 @@ impl<T> WeakList<T> {
         }
     }
 
-    /// Push a value and return its `Rc`-like handler.
-    pub fn push(&self, value: T) -> Handle<T> {
+    /// Wrap a value into `Handle` and push the weak reference into the list.
+    ///
+    /// # Warning
+    /// When it returns, the `Handle` is currently the only strong reference
+    /// to the value. So discard the return value like `list.new_elem(value);`
+    /// will cause the value being dropped and removed from `list` immediately,
+    /// which is quite meaningless.
+    pub fn new_elem(&self, value: T) -> Handle<T> {
         use std::mem::replace;
 
         let node = Rc::new(Node {
@@ -109,13 +130,15 @@ impl<T> WeakList<T> {
     ///
     /// Note that it never cause the drop of any value.
     /// All values existing in the `WeakList` must still be strongly
-    /// referenced by some `Handle`.
+    /// referenced by some `Handle`s outside.
     pub fn clear(&self) {
         self.take_all();
     }
 
     /// Take a snapshot for all weak-referenced values in the `WeakList`
     /// and upgrade them.
+    ///
+    /// It will not change the list.
     pub fn upgrade_all(&self) -> Vec<Handle<T>> {
         let mut v = vec![];
         let mut cur = self.head.borrow().next.clone();
@@ -130,7 +153,7 @@ impl<T> WeakList<T> {
     /// The same as `upgrade_all`, except it clears the list before return.
     pub fn take_all(&self) -> Vec<Handle<T>> {
         let v = self.upgrade_all();
-        v.iter().for_each(|h| { Handle::remove(&h); });
+        v.iter().for_each(|h| Handle::detach(&h));
         v
     }
 }
@@ -173,9 +196,9 @@ mod tests {
             let get_snapshot = || get_values(&ls.upgrade_all());
             let mut handles = vec![];
 
-            handles.push(ls.push(new_s(1)));
-            handles.push(ls.push(new_s(2)));
-            handles.push(ls.push(new_s(3)));
+            handles.push(ls.new_elem(new_s(1)));
+            handles.push(ls.new_elem(new_s(2)));
+            handles.push(ls.new_elem(new_s(3)));
             assert_eq!(get_values(&handles), [1, 2, 3]);
             assert_eq!(get_snapshot(), [3, 2, 1]);
             assert_eq!(get_last_dropped(), []);
@@ -185,11 +208,11 @@ mod tests {
             assert_eq!(get_snapshot(), [2, 1]);
             assert_eq!(get_last_dropped(), [3]);
 
-            ls.push(new_s(4)); // Immediately drop handle. FIXME: Wierd behavior.
+            ls.new_elem(new_s(4)); // Immediately drop handle.
             assert_eq!(get_snapshot(), [2, 1]);
             assert_eq!(get_last_dropped(), [4]);
 
-            Handle::remove(&handles[0]); // Remove `1` from list.
+            Handle::detach(&handles[0]); // Remove `1` from list.
             assert_eq!(get_values(&handles), [1, 2]); // Handles will not change.
             assert_eq!(get_snapshot(), [2]);
             assert_eq!(get_last_dropped(), []); // No drop now.
@@ -206,7 +229,7 @@ mod tests {
             handles.clear();
             assert_eq!(get_last_dropped(), [2]);
 
-            handles.push(ls.push(new_s(5)));
+            handles.push(ls.new_elem(new_s(5)));
             handles = ls.take_all();
             assert_eq!(get_values(&handles), [5]);
             assert_eq!(get_snapshot(), []); // `take_all` remove all elems from list.
