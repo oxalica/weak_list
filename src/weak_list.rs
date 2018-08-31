@@ -1,11 +1,11 @@
-use std::cell::RefCell;
 use std::ops::Deref;
-use std::rc::{Rc, Weak};
+use std::cell::{Cell, UnsafeCell};
+use std::ptr::NonNull;
 
 /// The `Rc`-like handle owning a value,
 /// which may have at most one weak reference in a list.
 pub struct Handle<T> {
-    cur: Rc<Node<T>>,
+    cur: NonNull<Node<T>>,
 }
 
 /// The list of weak references of T.
@@ -14,25 +14,55 @@ pub struct Handle<T> {
 /// immediately, it will be removed from the list and both the space of value
 /// and its weak reference will be freed completely.
 pub struct WeakList<T> {
-    head: Rc<RefCell<Link<T>>>,
+    head: Box<UnsafeCell<NodePtr<T>>>,
 }
+
+type NodePtr<T> = Option<NonNull<Node<T>>>;
 
 struct Node<T> {
     value: T,
-    link: Rc<RefCell<Link<T>>>,
+    strong_count: Cell<usize>,
+    prev_next: Cell<Option<NonNull<NodePtr<T>>>>,
+    next: UnsafeCell<NodePtr<T>>,
 }
 
-struct Link<T> {
-    next: Option<Weak<Node<T>>>,
-    prev: Option<Weak<RefCell<Link<T>>>>,
+impl<T> Node<T> {
+    unsafe fn new_before(next_ptr: NodePtr<T>, value: T) -> NonNull<Node<T>> {
+        let b = Box::new(Node {
+            value,
+            strong_count: Cell::new(0), // Begin at 0
+            prev_next: Cell::new(None),
+            next: UnsafeCell::new(next_ptr),
+        });
+        if let Some(next) = next_ptr {
+            let rev_ptr = NonNull::new_unchecked(b.next.get());
+            next.as_ref().prev_next.set(Some(rev_ptr));
+        }
+        NonNull::new_unchecked(Box::into_raw(b))
+    }
+
+    unsafe fn unlink(&self) {
+        if let Some(mut prev_next) = self.prev_next.take() { // Linked
+            *prev_next.as_mut() = *self.next.get();
+            if let Some(next) = *self.next.get() { // Has next
+                next.as_ref().prev_next.set(Some(prev_next));
+            }
+        }
+    }
 }
 
 impl<T> Handle<T> {
+    unsafe fn from_raw_node(node: NonNull<Node<T>>) -> Self {
+        let count = &node.as_ref().strong_count;
+        count.set(count.get() + 1);
+        Handle { cur: node }
+    }
+
     /// Detach the value from the list.
     /// It removes and frees the weak reference of it in the list immediately
     /// (if exists).
     pub fn detach(this: &Self) {
-        this.cur.link.borrow_mut().unlink();
+        unsafe { this.cur.as_ref().unlink(); }
     }
 
     /// Try unwrap the value if `this` is the only `Handle` to it.
@@ -41,16 +71,27 @@ impl<T> Handle<T> {
     /// also be removed and freed.
     /// Otherwise, `this` will be returned back with nothing happened.
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        match Rc::try_unwrap(this.cur) {
-            Ok(node) => Ok(node.value),
-            Err(cur) => Err(Handle { cur }),
+        unsafe {
+            Self::detach(&this);
+            match this.cur.as_ref().strong_count.get() {
+                1 => {
+                    let b = Box::from_raw(this.cur.as_ptr());
+                    ::std::mem::forget(this);
+                    Ok(b.value)
+                }
+                _ => Err(this),
+            }
         }
     }
 }
 
 impl<T> Clone for Handle<T> {
     fn clone(&self) -> Self {
-        Handle { cur: Rc::clone(&self.cur) }
+        unsafe {
+            let count = &self.cur.as_ref().strong_count;
+            count.set(count.get() + 1);
+            Handle { cur: self.cur }
+        }
     }
 }
 
@@ -58,38 +99,22 @@ impl<T> Deref for Handle<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.cur.value
+        unsafe { &self.cur.as_ref().value }
     }
 }
 
-impl<T> Link<T> {
-    fn new() -> Self {
-        Link {
-            next: None,
-            prev: None,
-        }
-    }
-
-    fn unlink(&mut self) {
-        // If in list.
-        if let Some(prev_w) = self.prev.take() {
-            let prev = prev_w.upgrade().unwrap();
-            let mut prev_link = prev.borrow_mut();
-            match self.next.take() {
-                None => prev_link.next = None,
-                Some(next_w) => {
-                    let next_node = next_w.upgrade().unwrap();
-                    prev_link.next = Some(Rc::downgrade(&next_node));
-                    next_node.link.borrow_mut().prev = Some(prev_w);
-                }
+impl<T> Drop for Handle<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let count = &self.cur.as_ref().strong_count;
+            match count.get() {
+                1 => {
+                    Handle::detach(&self);
+                    drop(Box::from_raw(self.cur.as_ptr()));
+                },
+                x => count.set(x - 1),
             }
         }
-    }
-}
-
-impl<T> Drop for Link<T> {
-    fn drop(&mut self) {
-        self.unlink();
     }
 }
 
@@ -97,7 +122,7 @@ impl<T> WeakList<T> {
     /// Create an empty list.
     pub fn new() -> Self {
         WeakList {
-            head: Rc::new(RefCell::new(Link::new()))
+            head: Box::new(UnsafeCell::new(None)),
         }
     }
 
@@ -109,21 +134,14 @@ impl<T> WeakList<T> {
     /// will cause the value being dropped and removed from `list` immediately,
     /// which is quite meaningless.
     pub fn new_elem(&self, value: T) -> Handle<T> {
-        use std::mem::replace;
-
-        let node = Rc::new(Node {
-            value,
-            link: Rc::new(RefCell::new(Link {
-                next: self.head.borrow_mut().next.clone(),
-                prev: Some(Rc::downgrade(&self.head)),
-            })),
-        });
-        let mut head = self.head.borrow_mut();
-        if let Some(old_w) = replace(&mut head.next, Some(Rc::downgrade(&node))) {
-            let old_node = old_w.upgrade().unwrap();
-            old_node.link.borrow_mut().prev = Some(Rc::downgrade(&node.link));
+        unsafe {
+            let old_first = *self.head.get();
+            let new_first = Node::new_before(old_first, value);
+            let head_place = NonNull::new_unchecked(self.head.get());
+            new_first.as_ref().prev_next.set(Some(head_place));
+            *self.head.get() = Some(new_first);
+            Handle::from_raw_node(new_first)
         }
-        Handle { cur: node }
     }
 
     /// Clear the list and free spaces for all weak references.
@@ -140,14 +158,15 @@ impl<T> WeakList<T> {
     ///
     /// It will not change the list.
     pub fn upgrade_all(&self) -> Vec<Handle<T>> {
-        let mut v = vec![];
-        let mut cur = self.head.borrow().next.clone();
-        while let Some(node_w) = cur {
-            let node = node_w.upgrade().unwrap();
-            cur = node.link.borrow().next.clone();
-            v.push(Handle { cur: node });
+        unsafe {
+            let mut v = vec![];
+            let mut cur = *self.head.get();
+            while let Some(cur_node) = cur {
+                v.push(Handle::from_raw_node(cur_node));
+                cur = *cur_node.as_ref().next.get();
+            }
+            v
         }
-        v
     }
 
     /// The same as `upgrade_all`, except it clears the list before return.
@@ -167,6 +186,8 @@ impl<T> Default for WeakList<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+    use std::cell::RefCell;
 
     struct S {
         value: i32,
